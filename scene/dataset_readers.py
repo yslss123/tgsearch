@@ -25,6 +25,7 @@ import pandas as pd
 from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
 from data_utils.phoneme_utils import load_phone_csv, get_phone_features
+from data_utils.phoneme_phase import compute_phone_phase, get_phone_phase_window
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -96,7 +97,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True, phone_data=None):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True, phone_data=None, phone_phase=None):
     cam_infos = []
     postfix_dict = {"deepspeech": "ds", "esperanto": "eo", "hubert": "hu"}
 
@@ -222,6 +223,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             if phone_data is not None:
                 phone_frame_id = int(frame['img_id']) if audio_file == '' else idx
                 talking_dict.update(get_phone_features(phone_data, phone_frame_id))
+                if phone_phase is not None:
+                    talking_dict['phone_phase'] = get_phone_phase_window(phone_phase, phone_frame_id)
 
             talking_dict['blink'] = torch.as_tensor(np.clip(au_blink[frame['img_id']], 0, 2) / 2)
             talking_dict['au25'] = [au25[frame['img_id']], au25_25, au25_50, au25_75, au25_100]
@@ -288,9 +291,14 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=N
             phone_vocab=getattr(args, "phone_vocab", ""),
             expected_frame_ids=expected_ids,
         )
+    phone_phase = compute_phone_phase(phone_data) if (phone_data is not None and getattr(args, 'use_phone_phase', False)) else None
+    if getattr(args, 'use_phone_phase', False) and phone_phase is None:
+        raise ValueError('E2 requires --use_phoneme, --phone_csv and --phone_vocab')
+    if phone_phase is not None:
+        print('[E2] Phoneme phase features enabled:', phone_phase.shape)
     if not eval:
         print("Reading Training Transforms")
-        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor, phone_data=phone_data)
+        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor, phone_data=phone_data, phone_phase=phone_phase)
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file, audio_extractor, phone_data=phone_data)
     
