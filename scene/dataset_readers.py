@@ -24,6 +24,7 @@ import pandas as pd
 
 from utils.sh_utils import SH2RGB
 from utils.audio_utils import get_audio_features
+from data_utils.phoneme_utils import load_phone_csv, get_phone_features
 from scene.gaussian_model import BasicPointCloud
 
 class CameraInfo(NamedTuple):
@@ -95,7 +96,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True, phone_data=None):
     cam_infos = []
     postfix_dict = {"deepspeech": "ds", "esperanto": "eo", "hubert": "hu"}
 
@@ -215,6 +216,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 if idx >= auds.shape[0]:
                     break
 
+            # E1: same 8-frame context as the acoustic features.
+            # Native training: CSV frame_idx matches TG img_id.
+            # External audio: CSV frame_idx matches the new audio frame index.
+            if phone_data is not None:
+                phone_frame_id = int(frame['img_id']) if audio_file == '' else idx
+                talking_dict.update(get_phone_features(phone_data, phone_frame_id))
 
             talking_dict['blink'] = torch.as_tensor(np.clip(au_blink[frame['img_id']], 0, 2) / 2)
             talking_dict['au25'] = [au25[frame['img_id']], au25_25, au25_50, au25_75, au25_100]
@@ -257,11 +264,35 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=None):
     audio_file = args.audio
     audio_extractor = args.audio_extractor
+
+    phone_data = None
+    if getattr(args, "use_phoneme", False):
+        phone_csv = getattr(args, "phone_csv", "")
+        if not phone_csv:
+            raise ValueError("E1 requires --phone_csv when --use_phoneme is set")
+
+        expected_ids = None
+        if audio_file == '':
+            # Check the full native train/val frame-ID union before loading.
+            expected_ids = set()
+            for transforms_name in ("transforms_train.json", "transforms_val.json"):
+                with open(os.path.join(path, transforms_name), "r", encoding="utf-8") as f:
+                    expected_ids.update(
+                        int(frame["img_id"]) for frame in json.load(f)["frames"]
+                    )
+        else:
+            print("[E1] External audio: --phone_csv must be aligned to the NEW audio, not the training video.")
+
+        phone_data = load_phone_csv(
+            phone_csv,
+            phone_vocab=getattr(args, "phone_vocab", ""),
+            expected_frame_ids=expected_ids,
+        )
     if not eval:
         print("Reading Training Transforms")
-        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor)
+        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor, phone_data=phone_data)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file, audio_extractor)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file, audio_extractor, phone_data=phone_data)
     
     # if not eval:
     #     train_cam_infos.extend(test_cam_infos)
