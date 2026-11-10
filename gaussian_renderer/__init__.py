@@ -27,6 +27,16 @@ def _get_phone_tensors(viewpoint_camera, motion_net, device):
     return td["phone_ids"].to(device), td["phone_valid"].to(device)
 
 
+def _get_phone_phase(viewpoint_camera, motion_net, device):
+    """Optional E2 phase window; only used when the E2 motion net is enabled."""
+    if not getattr(motion_net, "use_phone_phase", False):
+        return None
+    td = viewpoint_camera.talking_dict
+    if "phone_phase" not in td:
+        raise KeyError("E2: Camera.talking_dict lacks phone_phase")
+    return td["phone_phase"].to(device)
+
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
@@ -155,9 +165,10 @@ def render_motion(viewpoint_camera, pc : GaussianModel, motion_net : MotionNetwo
     # ind_code = motion_net.individual_codes[frame_idx if frame_idx is not None else viewpoint_camera.talking_dict["img_id"]]
     ind_code = None
     phone_ids, phone_valid = _get_phone_tensors(viewpoint_camera, motion_net, audio_feat.device)
+    phone_phase = _get_phone_phase(viewpoint_camera, motion_net, audio_feat.device)
     motion_preds = motion_net(
         pc.get_xyz, audio_feat, exp_feat, ind_code,
-        phone_ids=phone_ids, phone_valid=phone_valid
+        phone_ids=phone_ids, phone_valid=phone_valid, phone_phase=phone_phase
     )
     means3D = pc.get_xyz + motion_preds['d_xyz']
     means2D = screenspace_points
@@ -251,8 +262,9 @@ def render_motion_mouth(viewpoint_camera, pc : GaussianModel, motion_net : Mouth
     audio_feat = viewpoint_camera.talking_dict["auds"].cuda()
 
     phone_ids, phone_valid = _get_phone_tensors(viewpoint_camera, motion_net, audio_feat.device)
+    phone_phase = _get_phone_phase(viewpoint_camera, motion_net, audio_feat.device)
     motion_preds = motion_net(
-        pc.get_xyz, audio_feat, phone_ids=phone_ids, phone_valid=phone_valid
+        pc.get_xyz, audio_feat, phone_ids=phone_ids, phone_valid=phone_valid, phone_phase=phone_phase
     )
     means3D = pc.get_xyz + motion_preds['d_xyz']
     means2D = screenspace_points
