@@ -57,6 +57,10 @@ class ModelParams(ParamGroup):
         self.audio = ""                # 推理时指定的音频特征 .npy 路径；留空则读数据目录下的 aud_ds/aud_hu/aud_eo.npy
         self.init_num = 10_000         # 初始高斯点数量，用于随机生成初始点云 points3d.ply
         self.audio_extractor = "deepspeech"  # 音频特征提取器：deepspeech(29维) / hubert(1024维) / esperanto(44维)
+        # E1 (opt-in): phonemes are disabled by default, preserving the original TG.
+        self.use_phoneme = False
+        self.phone_csv = ""             # Frame-aligned phone CSV (frame_idx/audio_time_s/phone)
+        self.phone_vocab = ""           # Fixed vocabulary JSON used by train and inference
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
