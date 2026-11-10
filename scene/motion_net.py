@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+from pathlib import Path
 
 from encoding import get_encoder
 
@@ -89,6 +91,61 @@ class MLP(nn.Module):
         return x
 
 
+
+class PhonemeFusion(nn.Module):
+    """E1: add aligned phoneme embeddings to per-frame audio tokens.
+
+    The projection is zero-initialized, so the module starts as the original
+    acoustic-only model and can learn a phoneme residual during training.
+    This is a simple fusion baseline, NOT phase-aware temporal modeling.
+    """
+    def __init__(self, num_phones, audio_dim, phone_dim=16):
+        super().__init__()
+        self.phone_embedding = nn.Embedding(num_phones, phone_dim, padding_idx=0)
+        self.phone_proj = nn.Linear(phone_dim, audio_dim, bias=False)
+        nn.init.zeros_(self.phone_proj.weight)
+
+    def forward(self, audio_tokens, phone_ids, phone_valid):
+        if phone_ids is None or phone_valid is None:
+            raise ValueError("E1 requires both phone_ids and phone_valid")
+
+        ids = phone_ids.reshape(-1).to(device=audio_tokens.device, dtype=torch.long)
+        valid = phone_valid.reshape(-1).to(
+            device=audio_tokens.device, dtype=audio_tokens.dtype
+        )
+        if audio_tokens.ndim != 2 or ids.numel() != audio_tokens.shape[0] or valid.numel() != audio_tokens.shape[0]:
+            raise ValueError(
+                "E1 requires audio_tokens [T,D], phone_ids [T], phone_valid [T]"
+            )
+
+        # Masked/unknown labels must have zero impact on acoustic features.
+        phone_delta = self.phone_proj(self.phone_embedding(ids))
+        return audio_tokens + phone_delta * valid.unsqueeze(-1)
+
+
+def build_phoneme_fusion(args, audio_dim):
+    if not getattr(args, "use_phoneme", False):
+        return None
+
+    vocab_file = getattr(args, "phone_vocab", "")
+    if not vocab_file:
+        csv_file = getattr(args, "phone_csv", "")
+        if not csv_file:
+            raise ValueError("E1 requires --phone_csv and a fixed phone vocabulary")
+        vocab_file = str(Path(csv_file).parent / "phone_vocab.json")
+
+    with open(Path(vocab_file).expanduser(), "r", encoding="utf-8") as f:
+        vocab = json.load(f)
+    ids = [int(v) for v in vocab.values()]
+    if not ids or len(ids) != len(set(ids)) or min(ids) < 0:
+        raise ValueError("Invalid phone vocabulary IDs in " + str(vocab_file))
+    num_phones = max(ids) + 1
+    print("[E1] Phoneme fusion enabled: {} symbols from {}".format(
+        num_phones, vocab_file
+    ))
+    return PhonemeFusion(num_phones=num_phones, audio_dim=audio_dim)
+
+
 class MotionNetwork(nn.Module):
     def __init__(self,
                  audio_dim = 32,
@@ -119,6 +176,8 @@ class MotionNetwork(nn.Module):
         self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
 
         self.audio_att_net = AudioAttNet(self.audio_dim)
+        self.phoneme_fusion = build_phoneme_fusion(args, self.audio_dim)
+        self.use_phoneme = self.phoneme_fusion is not None
 
         # DYNAMIC PART
         self.num_levels = 12
@@ -164,24 +223,26 @@ class MotionNetwork(nn.Module):
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
     
 
-    def encode_audio(self, a):
+    def encode_audio(self, a, phone_ids=None, phone_valid=None):
         # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
         # if emb, a should be: [1, 16] or [8, 16]
 
         # fix audio traininig
         if a is None: return None
 
-        enc_a = self.audio_net(a) # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, 64]
+        enc_a = self.audio_net(a) # [1/8, audio_dim]
+        if self.phoneme_fusion is not None:
+            enc_a = self.phoneme_fusion(enc_a, phone_ids, phone_valid)
+        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, audio_dim]
             
         return enc_a
 
 
-    def forward(self, x, a, e=None, c=None):
+    def forward(self, x, a, e=None, c=None, phone_ids=None, phone_valid=None):
         # x: [N, 3], in [-bound, bound]
         enc_x = self.encode_x(x, bound=self.bound)
 
-        enc_a = self.encode_audio(a)
+        enc_a = self.encode_audio(a, phone_ids, phone_valid)
         enc_a = enc_a.repeat(enc_x.shape[0], 1)
         aud_ch_att = self.aud_ch_att_net(enc_x)
         enc_w = enc_a * aud_ch_att
@@ -223,6 +284,8 @@ class MotionNetwork(nn.Module):
             {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
         ]
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
+        if self.phoneme_fusion is not None:
+            params.append({'params': self.phoneme_fusion.parameters(), 'lr': lr_net, 'weight_decay': wd})
         if self.individual_dim > 0:
             params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
         
@@ -265,6 +328,8 @@ class MouthMotionNetwork(nn.Module):
         self.audio_net = AudioNet(self.audio_in_dim, self.audio_dim)
 
         self.audio_att_net = AudioAttNet(self.audio_dim)
+        self.phoneme_fusion = build_phoneme_fusion(args, self.audio_dim)
+        self.use_phoneme = self.phoneme_fusion is not None
 
         # DYNAMIC PART
         self.num_levels = 12
@@ -285,15 +350,17 @@ class MouthMotionNetwork(nn.Module):
         self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
     
 
-    def encode_audio(self, a):
+    def encode_audio(self, a, phone_ids=None, phone_valid=None):
         # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
         # if emb, a should be: [1, 16] or [8, 16]
 
         # fix audio traininig
         if a is None: return None
 
-        enc_a = self.audio_net(a) # [1/8, 64]
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, 64]
+        enc_a = self.audio_net(a) # [1/8, audio_dim]
+        if self.phoneme_fusion is not None:
+            enc_a = self.phoneme_fusion(enc_a, phone_ids, phone_valid)
+        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, audio_dim]
             
         return enc_a
     
@@ -316,11 +383,11 @@ class MouthMotionNetwork(nn.Module):
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
 
 
-    def forward(self, x, a):
+    def forward(self, x, a, phone_ids=None, phone_valid=None):
         # x: [N, 3], in [-bound, bound]
         enc_x = self.encode_x(x, bound=self.bound)
 
-        enc_a = self.encode_audio(a)
+        enc_a = self.encode_audio(a, phone_ids, phone_valid)
         enc_w = enc_a.repeat(enc_x.shape[0], 1)
         # aud_ch_att = self.aud_ch_att_net(enc_x)
         # enc_w = enc_a * aud_ch_att
@@ -349,6 +416,8 @@ class MouthMotionNetwork(nn.Module):
             {'params': self.sigma_net.parameters(), 'lr': lr_net, 'weight_decay': wd},
         ]
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
+        if self.phoneme_fusion is not None:
+            params.append({'params': self.phoneme_fusion.parameters(), 'lr': lr_net, 'weight_decay': wd})
         if self.individual_dim > 0:
             params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
         
