@@ -228,6 +228,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # loss += 0.5 * lpips_criterion(image_t[None, ...] * 2 - 1, gt_image_t[None, ...] * 2 - 1).mean()
 
 
+        # E2: generic phoneme-onset supervision on the visible outer-lip area.
+        # Use the original Face masks; do not supervise the Mouth branch's
+        # interior in Face training. Disabled for E0/E1 or weight=0.
+        if (getattr(dataset, "use_phone_phase", False)
+                and getattr(dataset, "e2_lip_weight", 0.0) > 0
+                and iteration > warm_step):
+            phase = viewpoint_cam.talking_dict["phone_phase"]
+            onset_strength = float(phase[4, 1].item())
+            if onset_strength > 0:
+                x0, x1, y0, y1 = viewpoint_cam.talking_dict["lips_rect"]
+                height, width = image_white.shape[-2:]
+                x0, x1 = max(0, x0), min(height, x1)
+                y0, y1 = max(0, y0), min(width, y1)
+                if x0 < x1 and y0 < y1:
+                    outer_lips = torch.zeros_like(mouth_mask, dtype=torch.bool)
+                    outer_lips[x0:x1, y0:y1] = True
+                    outer_lips = outer_lips & (~mouth_mask.bool())
+                    if outer_lips.any():
+                        lips_l1 = (image_white[:, outer_lips] -
+                                   gt_image_white[:, outer_lips]).abs().mean()
+                        loss = loss + dataset.e2_lip_weight * onset_strength * lips_l1
+
         loss.backward()
 
         iter_end.record()
