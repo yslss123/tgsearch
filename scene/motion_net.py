@@ -29,12 +29,14 @@ class AudioAttNet(nn.Module):
             nn.Softmax(dim=1)
         )
 
-    def forward(self, x):
-        # x: [1, seq_len, dim_aud]
-        y = x.permute(0, 2, 1)  # [1, dim_aud, seq_len]
-        y = self.attentionConvNet(y) 
-        y = self.attentionNet(y.view(1, self.seq_len)).view(1, self.seq_len, 1)
-        return torch.sum(y * x, dim=1) # [1, dim_aud]
+    def forward(self, x, logit_bias=None):
+        # x: [1, seq_len, dim_aud]. Default behavior is exactly E1/TG.
+        y = self.attentionConvNet(x.permute(0, 2, 1))
+        logits = self.attentionNet[0](y.view(1, self.seq_len))
+        if logit_bias is not None:
+            logits = logits + logit_bias.reshape(1, self.seq_len)
+        weights = torch.softmax(logits, dim=1).view(1, self.seq_len, 1)
+        return torch.sum(weights * x, dim=1)  # [1, dim_aud]
 
 
 # Audio feature extractor
@@ -90,6 +92,47 @@ class MLP(nn.Module):
                 
         return x
 
+
+
+
+class PhaseAwareTemporal(nn.Module):
+    """E2: generic onset/offset-sensitive temporal aggregation.
+
+    The features are phoneme-relative progress, start/end proximity, duration.
+    Unlike E1's class embedding, this module changes attention logits and
+    provides a center-token preservation path. All new contributions start
+    at zero so E2 starts with exact E1 features for fixed E1 weights.
+    """
+
+    def __init__(self, dim_aud=32, phase_dim=4):
+        super().__init__()
+        self.phase_net = nn.Sequential(
+            nn.Linear(phase_dim, 16),
+            nn.ReLU(inplace=False),
+            nn.Linear(16, dim_aud)
+        )
+        nn.init.zeros_(self.phase_net[-1].weight)
+        nn.init.zeros_(self.phase_net[-1].bias)
+
+        self.logit_net = nn.Linear(phase_dim, 1, bias=False)
+        nn.init.zeros_(self.logit_net.weight)
+        self.center_scale = nn.Parameter(torch.zeros(()))
+
+    def forward(self, tokens, phase, phone_valid):
+        if phase is None or phone_valid is None:
+            raise ValueError("E2 requires phone_phase and phone_valid")
+        if tokens.ndim != 2 or phase.shape != (tokens.shape[0], 4):
+            raise ValueError("E2 expects tokens [T,D] and phase [T,4]")
+        phase = phase.to(device=tokens.device, dtype=tokens.dtype)
+        valid = phone_valid.reshape(-1).to(device=tokens.device, dtype=tokens.dtype)
+        # All reserved/silence/unknown phones have exactly zero phase features.
+        active = ((phase.abs().sum(-1) > 0).to(tokens.dtype) * valid)
+        tokens = tokens + self.phase_net(phase) * active[:, None]
+        attn_bias = self.logit_net(phase).squeeze(-1) * active
+        # The central token is the target frame in TG's 8-frame context.
+        center = tokens.shape[0] // 2
+        center_gain = torch.tanh(self.center_scale) * active[center]
+        return tokens, attn_bias, center_gain
 
 
 class PhonemeFusion(nn.Module):
@@ -178,6 +221,10 @@ class MotionNetwork(nn.Module):
         self.audio_att_net = AudioAttNet(self.audio_dim)
         self.phoneme_fusion = build_phoneme_fusion(args, self.audio_dim)
         self.use_phoneme = self.phoneme_fusion is not None
+        self.use_phone_phase = bool(getattr(args, "use_phone_phase", False))
+        if self.use_phone_phase and not self.use_phoneme:
+            raise ValueError("E2 --use_phone_phase requires --use_phoneme")
+        self.phase_temporal = PhaseAwareTemporal(self.audio_dim) if self.use_phone_phase else None
 
         # DYNAMIC PART
         self.num_levels = 12
@@ -223,7 +270,7 @@ class MotionNetwork(nn.Module):
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
     
 
-    def encode_audio(self, a, phone_ids=None, phone_valid=None):
+    def encode_audio(self, a, phone_ids=None, phone_valid=None, phone_phase=None):
         # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
         # if emb, a should be: [1, 16] or [8, 16]
 
@@ -233,16 +280,21 @@ class MotionNetwork(nn.Module):
         enc_a = self.audio_net(a) # [1/8, audio_dim]
         if self.phoneme_fusion is not None:
             enc_a = self.phoneme_fusion(enc_a, phone_ids, phone_valid)
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, audio_dim]
-            
+        if self.phase_temporal is not None:
+            enc_a, attn_bias, center_gain = self.phase_temporal(enc_a, phone_phase, phone_valid)
+            center_token = enc_a[enc_a.shape[0] // 2].unsqueeze(0)
+            summary = self.audio_att_net(enc_a.unsqueeze(0), logit_bias=attn_bias)
+            enc_a = summary + center_gain * (center_token - summary)
+        else:
+            enc_a = self.audio_att_net(enc_a.unsqueeze(0))
         return enc_a
 
 
-    def forward(self, x, a, e=None, c=None, phone_ids=None, phone_valid=None):
+    def forward(self, x, a, e=None, c=None, phone_ids=None, phone_valid=None, phone_phase=None):
         # x: [N, 3], in [-bound, bound]
         enc_x = self.encode_x(x, bound=self.bound)
 
-        enc_a = self.encode_audio(a, phone_ids, phone_valid)
+        enc_a = self.encode_audio(a, phone_ids, phone_valid, phone_phase)
         enc_a = enc_a.repeat(enc_x.shape[0], 1)
         aud_ch_att = self.aud_ch_att_net(enc_x)
         enc_w = enc_a * aud_ch_att
@@ -286,6 +338,8 @@ class MotionNetwork(nn.Module):
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
         if self.phoneme_fusion is not None:
             params.append({'params': self.phoneme_fusion.parameters(), 'lr': lr_net, 'weight_decay': wd})
+        if self.phase_temporal is not None:
+            params.append({'params': self.phase_temporal.parameters(), 'lr': lr_net, 'weight_decay': wd})
         if self.individual_dim > 0:
             params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
         
@@ -330,6 +384,10 @@ class MouthMotionNetwork(nn.Module):
         self.audio_att_net = AudioAttNet(self.audio_dim)
         self.phoneme_fusion = build_phoneme_fusion(args, self.audio_dim)
         self.use_phoneme = self.phoneme_fusion is not None
+        self.use_phone_phase = bool(getattr(args, "use_phone_phase", False))
+        if self.use_phone_phase and not self.use_phoneme:
+            raise ValueError("E2 --use_phone_phase requires --use_phoneme")
+        self.phase_temporal = PhaseAwareTemporal(self.audio_dim) if self.use_phone_phase else None
 
         # DYNAMIC PART
         self.num_levels = 12
@@ -350,7 +408,7 @@ class MouthMotionNetwork(nn.Module):
         self.aud_ch_att_net = MLP(self.in_dim, self.audio_dim, 32, 2)
     
 
-    def encode_audio(self, a, phone_ids=None, phone_valid=None):
+    def encode_audio(self, a, phone_ids=None, phone_valid=None, phone_phase=None):
         # a: [1, 29, 16] or [8, 29, 16], audio features from deepspeech
         # if emb, a should be: [1, 16] or [8, 16]
 
@@ -360,8 +418,13 @@ class MouthMotionNetwork(nn.Module):
         enc_a = self.audio_net(a) # [1/8, audio_dim]
         if self.phoneme_fusion is not None:
             enc_a = self.phoneme_fusion(enc_a, phone_ids, phone_valid)
-        enc_a = self.audio_att_net(enc_a.unsqueeze(0)) # [1, audio_dim]
-            
+        if self.phase_temporal is not None:
+            enc_a, attn_bias, center_gain = self.phase_temporal(enc_a, phone_phase, phone_valid)
+            center_token = enc_a[enc_a.shape[0] // 2].unsqueeze(0)
+            summary = self.audio_att_net(enc_a.unsqueeze(0), logit_bias=attn_bias)
+            enc_a = summary + center_gain * (center_token - summary)
+        else:
+            enc_a = self.audio_att_net(enc_a.unsqueeze(0))
         return enc_a
     
 
@@ -383,11 +446,11 @@ class MouthMotionNetwork(nn.Module):
         return torch.cat([feat_xy, feat_yz, feat_xz], dim=-1)
 
 
-    def forward(self, x, a, phone_ids=None, phone_valid=None):
+    def forward(self, x, a, phone_ids=None, phone_valid=None, phone_phase=None):
         # x: [N, 3], in [-bound, bound]
         enc_x = self.encode_x(x, bound=self.bound)
 
-        enc_a = self.encode_audio(a, phone_ids, phone_valid)
+        enc_a = self.encode_audio(a, phone_ids, phone_valid, phone_phase)
         enc_w = enc_a.repeat(enc_x.shape[0], 1)
         # aud_ch_att = self.aud_ch_att_net(enc_x)
         # enc_w = enc_a * aud_ch_att
@@ -418,6 +481,8 @@ class MouthMotionNetwork(nn.Module):
         params.append({'params': self.audio_att_net.parameters(), 'lr': lr_net * 5, 'weight_decay': 0.0001})
         if self.phoneme_fusion is not None:
             params.append({'params': self.phoneme_fusion.parameters(), 'lr': lr_net, 'weight_decay': wd})
+        if self.phase_temporal is not None:
+            params.append({'params': self.phase_temporal.parameters(), 'lr': lr_net, 'weight_decay': wd})
         if self.individual_dim > 0:
             params.append({'params': self.individual_codes, 'lr': lr_net, 'weight_decay': wd})
         
