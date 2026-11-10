@@ -16,6 +16,17 @@ from scene.gaussian_model import GaussianModel
 from scene.motion_net import MotionNetwork, MouthMotionNetwork
 from utils.sh_utils import eval_sh
 
+
+def _get_phone_tensors(viewpoint_camera, motion_net, device):
+    """Only pass phone data when E1 was explicitly enabled."""
+    if not getattr(motion_net, "use_phoneme", False):
+        return None, None
+    td = viewpoint_camera.talking_dict
+    if "phone_ids" not in td or "phone_valid" not in td:
+        raise KeyError("E1: Camera.talking_dict lacks phone_ids/phone_valid")
+    return td["phone_ids"].to(device), td["phone_valid"].to(device)
+
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
@@ -143,7 +154,11 @@ def render_motion(viewpoint_camera, pc : GaussianModel, motion_net : MotionNetwo
 
     # ind_code = motion_net.individual_codes[frame_idx if frame_idx is not None else viewpoint_camera.talking_dict["img_id"]]
     ind_code = None
-    motion_preds = motion_net(pc.get_xyz, audio_feat, exp_feat, ind_code) #  
+    phone_ids, phone_valid = _get_phone_tensors(viewpoint_camera, motion_net, audio_feat.device)
+    motion_preds = motion_net(
+        pc.get_xyz, audio_feat, exp_feat, ind_code,
+        phone_ids=phone_ids, phone_valid=phone_valid
+    )
     means3D = pc.get_xyz + motion_preds['d_xyz']
     means2D = screenspace_points
     # opacity = pc.opacity_activation(pc._opacity + motion_preds['d_opa'])
@@ -235,7 +250,10 @@ def render_motion_mouth(viewpoint_camera, pc : GaussianModel, motion_net : Mouth
     
     audio_feat = viewpoint_camera.talking_dict["auds"].cuda()
 
-    motion_preds = motion_net(pc.get_xyz, audio_feat)
+    phone_ids, phone_valid = _get_phone_tensors(viewpoint_camera, motion_net, audio_feat.device)
+    motion_preds = motion_net(
+        pc.get_xyz, audio_feat, phone_ids=phone_ids, phone_valid=phone_valid
+    )
     means3D = pc.get_xyz + motion_preds['d_xyz']
     means2D = screenspace_points
     opacity = pc.get_opacity
