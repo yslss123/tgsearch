@@ -61,6 +61,8 @@ class ModelParams(ParamGroup):
         self.use_phoneme = False
         self.phone_csv = ""             # Frame-aligned phone CSV (frame_idx/audio_time_s/phone)
         self.phone_vocab = ""           # Fixed vocabulary JSON used by train and inference
+        self.use_phone_phase = False     # E2: learned phoneme-phase-aware temporal aggregation
+        self.e2_lip_weight = 0.02        # E2: additional onset-weighted outer-lip L1 loss in Face stage
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
