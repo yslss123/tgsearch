@@ -23,7 +23,7 @@ The FAN target is FAN output on GT RGB. The .lms points define the fixed same-fr
 ## CPU checks
 
     python train_lip_residual.py --self-test
-    python tests/test_lip_residual_losses.py
+    PYTHONPATH=. python tests/test_lip_residual_losses.py
 
 These checks do not load TG CUDA extensions, FAN weights, or test the real rasterizer gradient.
 

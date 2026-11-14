@@ -21,7 +21,7 @@ from data_utils.phoneme_utils import load_phone_csv
 from scene.lip_residual_net import LipResidualMotionNetwork
 from tg_lip_stage2b_rgb_fan_probe import (
     face_bbox, mouth_bbox, fan_landmarks, mouth_geometry, geometry_loss,
-    load_fan, make_mouth_background, render_final_fuse,
+    load_fan, render_final_fuse,
 )
 from tg_lip_stage2_geometry_probe import choose_frames
 
@@ -526,6 +526,10 @@ def main():
             raise ValueError("Resume checkpoint vocabulary size mismatch")
         if bool(saved.get("use_au", args.use_au)) != bool(args.use_au):
             raise ValueError("Resume checkpoint AU setting mismatch")
+        if abs(float(saved.get("max_delta", args.max_delta)) - args.max_delta) > 1e-12:
+            raise ValueError("Resume checkpoint max_delta mismatch")
+        if saved.get("phone_vocab") and saved["phone_vocab"] != phone_data["vocab"]:
+            raise ValueError("Resume checkpoint phone vocabulary mapping mismatch")
         model.load_state_dict(saved["model"], strict=True)
         if "optimizer" in saved:
             optimizer.load_state_dict(saved["optimizer"])
@@ -556,13 +560,25 @@ def main():
             initial["trained_landmark"], initial["trained_rgb"]
         ), flush=True
     )
+    if not args.resume:
+        best_val = initial["trained_total"]
+        save_checkpoint(
+            outdir / "lip_residual_best.pth", model, optimizer,
+            start_step, best_val, phone_data, args
+        )
+        print("[SAVE] zero-residual baseline stored as initial best checkpoint", flush=True)
 
     print("[7/7] Optimize only LipResidualMotionNetwork", flush=True)
     model.train()
     rng = random.Random(args.seed + start_step)
     skipped_total = 0
     skipped_consecutive = 0
-    for step in range(start_step + 1, args.iterations + 1):
+    step = start_step
+    attempts = 0
+    while step < args.iterations:
+        attempts += 1
+        if attempts > (args.iterations - start_step) * 5 + 100:
+            raise RuntimeError("Too many rejected samples; inspect FAN calibration.")
         frame = build_frame(
             rng.choice(train_views), cfg.source_path, gs_face, net_face,
             gs_mouth, net_mouth, fan, pipe, bg,
@@ -584,6 +600,7 @@ def main():
                 )
             continue
         skipped_consecutive = 0
+        step += 1
 
         delta = predict_delta(model, frame, gs_face, lip_weight, args.use_au, device)
         delta.retain_grad()
@@ -654,21 +671,17 @@ def main():
                 f.write(json.dumps(val, ensure_ascii=False) + "\n")
             if val["trained_total"] < best_val:
                 best_val = val["trained_total"]
-                torch.save({
-                    "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "iteration": step, "best_val": best_val,
-                    "phone_vocab": phone_data["vocab"], "vocab_size": vocab_size,
-                    "max_delta": args.max_delta, "use_au": args.use_au,
-                }, str(outdir / "lip_residual_best.pth"))
+                save_checkpoint(
+                    outdir / "lip_residual_best.pth", model, optimizer,
+                    step, best_val, phone_data, args
+                )
                 print("[SAVE] best residual checkpoint val={:.6f}".format(best_val), flush=True)
 
         if step % args.save_every == 0 or step == args.iterations:
-            torch.save({
-                "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                "iteration": step, "best_val": best_val,
-                "phone_vocab": phone_data["vocab"], "vocab_size": vocab_size,
-                "max_delta": args.max_delta, "use_au": args.use_au,
-            }, str(outdir / "lip_residual_latest.pth"))
+            save_checkpoint(
+                outdir / "lip_residual_latest.pth", model, optimizer,
+                step, best_val, phone_data, args
+            )
             print("[SAVE] latest checkpoint step={}".format(step), flush=True)
 
     print("[DONE] output={}".format(outdir.resolve()), flush=True)
