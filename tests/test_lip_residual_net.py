@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """CPU self-tests for LipResidualMotionNetwork; no TG CUDA extensions required."""
 import torch
-from scene.lip_residual_net import LipResidualMotionNetwork
+from lip_residual_net import LipResidualMotionNetwork
 
 
 def run():

@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from data_utils.phoneme_utils import load_phone_csv
-from scene.lip_residual_net import LipResidualMotionNetwork
+from lip_residual_net import LipResidualMotionNetwork
 from tg_lip_stage2b_rgb_fan_probe import (
     face_bbox, mouth_bbox, fan_landmarks, mouth_geometry, geometry_loss,
     load_fan, render_final_fuse,

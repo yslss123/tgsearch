@@ -4,7 +4,7 @@ This commit implements the first trainable E1 model component and opt-in phoneme
 
 ## What is included
 
-- `scene/lip_residual_net.py`: 8-frame phoneme context encoder, per-Gaussian spatial encoder, gated feature fusion, and bounded XYZ residual head.
+- `lip_residual_net.py`: 8-frame phoneme context encoder, per-Gaussian spatial encoder, gated feature fusion, and bounded XYZ residual head.
 - `tests/test_lip_residual_net.py`: CPU self-test without TG rasterizer/CUDA extensions.
 - Optional phoneme attachment in `scene/dataset_readers.py`: enabled only when the dataset args object has `phone_csv`; vanilla TG behavior is unchanged otherwise.
 
