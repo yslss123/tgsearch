@@ -95,7 +95,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".jpg", audio_file='', audio_extractor='deepspeech', preload=True, phone_data=None):
     cam_infos = []
     postfix_dict = {"deepspeech": "ds", "esperanto": "eo", "hubert": "hu"}
 
@@ -193,6 +193,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             talking_dict = {}
             talking_dict['img_id'] = frame['img_id']
 
+            # Optional frame-aligned phoneme context for the lip residual branch.
+            # Kept opt-in so the original TG training/inference path is unchanged.
+            if phone_data is not None:
+                from data_utils.phoneme_utils import get_phone_features
+                phone_features = get_phone_features(
+                    phone_data, frame['img_id'], window=8
+                )
+                talking_dict['phone_ids'] = phone_features['phone_ids']
+                talking_dict['phone_valid'] = phone_features['phone_valid']
+
             if preload:
                 teeth_mask_path = os.path.join(path, 'teeth_mask', str(frame['img_id']) + '.npy')
                 teeth_mask = np.load(teeth_mask_path)
@@ -257,11 +267,33 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 def readNerfSyntheticInfo(path, white_background, eval, extension=".jpg", args=None):
     audio_file = args.audio
     audio_extractor = args.audio_extractor
+
+    # Load the frame-aligned phone table once and share it across train/val.
+    # args.phone_csv is injected by the dedicated lip-residual training script;
+    # when absent, the vanilla TalkingGaussian path is byte-for-byte equivalent
+    # in its camera data (no phone fields are added).
+    phone_data = None
+    phone_csv = getattr(args, "phone_csv", None)
+    if phone_csv:
+        from data_utils.phoneme_utils import load_phone_csv
+        phone_data = load_phone_csv(
+            phone_csv,
+            phone_vocab=getattr(args, "phone_vocab", ""),
+            fps=float(getattr(args, "phone_fps", 25.0)),
+        )
+        print("[Phone] Enabled frame-aligned phone loading:", phone_csv)
+
     if not eval:
         print("Reading Training Transforms")
-        train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, audio_file, audio_extractor)
+        train_cam_infos = readCamerasFromTransforms(
+            path, "transforms_train.json", white_background, extension,
+            audio_file, audio_extractor, phone_data=phone_data
+        )
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_val.json", white_background, extension, audio_file, audio_extractor)
+    test_cam_infos = readCamerasFromTransforms(
+        path, "transforms_val.json", white_background, extension,
+        audio_file, audio_extractor, phone_data=phone_data
+    )
     
     # if not eval:
     #     train_cam_infos.extend(test_cam_infos)
